@@ -1,9 +1,14 @@
 #include <stdlib.h>
 
 #include "deet.h"
+#include "deet_run.h"
 
 int main(int argc, char *argv[]) {
-    // TO BE IMPLEMENTED
     // Remember: Do not put any functions other than main() in this file.
-    abort();
+
+    silent_logging = 0;
+
+    run_deet();
+
+    return 0;
 }
