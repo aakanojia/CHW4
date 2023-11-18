@@ -8,7 +8,7 @@ int main(int argc, char *argv[]) {
 
     silent_logging = 0;
 
-    run_deet();
+    run_deet(silent_logging);
 
     return 0;
 }

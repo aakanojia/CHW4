@@ -5,95 +5,18 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <stdbool.h>
+#include "helper.h"
 #include "debug.h"
 #include "deet.h"
 #include "deet_run.h"
 
-#define MAX_PROCESSES 128
-
-// Global flag for SIGCHLD signal
-volatile sig_atomic_t sigchld_received = 0;
-
-typedef struct {
-    pid_t pid; // Process ID
-    int deet_id; // Deet ID
-    char command_line[256]; // Command line
-} ProcessInfo;
-
-ProcessInfo process_table[MAX_PROCESSES];
-int process_count = 0;
-
-int get_deet_id(pid_t pid) {
-    for (int i = 0; i < process_count; i++) {
-        if (process_table[i].pid == pid) {
-            return process_table[i].deet_id;
-        }
-    }
-    return -1; // PID not found
-}
-
-const char* get_command_line(pid_t pid) {
-    for (int i = 0; i < process_count; i++) {
-        if (process_table[i].pid == pid) {
-            return process_table[i].command_line;
-        }
-    }
-    return ""; // PID not found
-}
-
-void sigint_handler(int sig) {
-    const char msg[] = "Caught SIGINT!\n";
-    write(STDOUT_FILENO, msg, sizeof(msg) - 1);
-    log_shutdown();
-}
-
-void sigchld_handler(int sig) {
-    sigchld_received = 1;
-    printf("DEBUG: SIGCHLD handler called with signal %d\n", sig); // Debug print
-    log_signal(sig); // Log the signal reception
-
-    // Handle SIGCHLD signal
-    int saved_errno = errno;
-    int status;
-    pid_t pid;
-
-    while ((pid = waitpid((pid_t)(-1), &status, WNOHANG)) > 0) {
-        if (WIFSTOPPED(status)) {
-            log_state_change(pid, PSTATE_STOPPING, PSTATE_STOPPED, WSTOPSIG(status));
-        }
-        if (WIFCONTINUED(status)) {
-            log_state_change(pid, PSTATE_CONTINUING, PSTATE_RUNNING, 0);
-        }
-    }
-
-    errno = saved_errno;
-}
-
-
-void handle_sigchld() {
-    // Iterate over process_table and print stopped processes
-    for (int i = 0; i < process_count; i++) {
-        int status;
-        pid_t result = waitpid(process_table[i].pid, &status, WNOHANG);
-        if (result > 0 && WIFSTOPPED(status)) {
-            // Process is stopped
-            printf("%d\t%d\tT\tstopped\t\t%s\n", process_table[i].deet_id, process_table[i].pid, process_table[i].command_line);
-        }
-    }
-
-    // Reset the flag
-    sigchld_received = 0;
-
-    // Re-display the prompt
-    printf("deet> ");
-    fflush(stdout);
-}
-
-void run_deet() {
+void run_deet(int silent_logging) {
     struct sigaction sa;
     sa.sa_handler = sigint_handler;
     sa.sa_flags = 0; // or SA_RESTART
     sigemptyset(&sa.sa_mask);
+    sigaddset(&sa.sa_mask, SIGCHLD); // Block SIGCHLD while handling SIGINT
 
     if (sigaction(SIGINT, &sa, NULL) == -1) {
         perror("sigaction");
@@ -104,6 +27,11 @@ void run_deet() {
     sa_chld.sa_handler = sigchld_handler;
     sa_chld.sa_flags = SA_RESTART | SA_NOCLDSTOP;
     sigemptyset(&sa_chld.sa_mask);
+
+    // Block other signals during SIGCHLD handling
+    sigaddset(&sa_chld.sa_mask, SIGINT);
+    sigaddset(&sa_chld.sa_mask, SIGTERM);
+    // Add other signals
 
     if (sigaction(SIGCHLD, &sa_chld, NULL) == -1) {
         perror("sigaction");
@@ -177,13 +105,78 @@ void run_deet() {
             printf("bt (1 args) -- Show a stack trace for a traced process\n");
         } else if (strcmp(command, "quit") == 0) {
             log_input("quit\n"); // Log the quit command
+
+            // Iterate through the process table and terminate each process
+            // for (int i = 0; i < process_count; i++) {
+            //     if (process_table[i].state != PSTATE_DEAD) {
+            //         kill(process_table[i].pid, SIGTERM); // Send SIGTERM to each process
+            //         waitpid(process_table[i].pid, NULL, 0); // Wait for the process to terminate
+            //     }
+            // }
+
             log_shutdown(); // Log shutdown
             break;
         } else if (strcmp(command, "show") == 0) {
+            log_input(command_line);
+            if (silent_logging == 0) {
+                printf("\n"); // Only print newline if logging is not silent
+            }
             // Show process info
+            int specific_deet_id = -1; // Default to -1, indicating no specific deet ID provided
+                if (args[0] != NULL) {
+                    specific_deet_id = atoi(args[0]); // Convert argument to integer
+                }
+
+                int found = 0; // Flag to check if any process is found
+                for (int i = 0; i < process_count; i++) {
+                        if (specific_deet_id == -1 || process_table[i].deet_id == specific_deet_id) {
+                            char state_char = process_table[i].traced ? 'T' : 'U';
+                            char *state_desc = "unknown";
+
+                            switch (process_table[i].state) {
+                                case PSTATE_RUNNING:
+                                    state_desc = "running";
+                                    break;
+                                case PSTATE_STOPPED:
+                                    state_desc = "stopped";
+                                    break;
+                                case PSTATE_DEAD:
+                                    state_desc = "dead";
+                                    break;
+                                case PSTATE_NONE:
+                                    state_desc = "none";
+                                    break;
+                                case PSTATE_STOPPING:
+                                    state_desc = "stopped";
+                                    break;
+                                case PSTATE_CONTINUING:
+                                    state_desc = "continuing";
+                                    break;
+                                case PSTATE_KILLED:
+                                    state_desc = "killed";
+                                    break;
+                                default:
+                                    state_desc = "unknown";
+                            }
+
+                            printf("%d\t%d\t%c\t%s\t\t%s\n",
+                                   process_table[i].deet_id, process_table[i].pid, state_char, state_desc, process_table[i].command_line);
+                            found = 1;
+                            if (specific_deet_id != -1) break;
+                        }
+                    }
+                if (!found) {
+                    if (specific_deet_id == -1) {
+                        printf("No processes are currently being managed.\n");
+                    } else {
+                        printf("No process found with Deet ID: %d\n", specific_deet_id);
+                    }
+                }
         } else if (strcmp(command, "run") == 0) {
             log_input(command_line);
-            printf("\n");
+            if (silent_logging == 0) {
+                printf("\n"); // Only print newline if logging is not silent
+            }
 
             // Start a process
             pid_t pid = fork();
@@ -203,19 +196,23 @@ void run_deet() {
                     process_table[process_count].pid = pid;
                     process_table[process_count].deet_id = deet_id;
                     strncpy(process_table[process_count].command_line, command_line, sizeof(process_table[process_count].command_line));
+                    process_table[process_count].traced = true;  // Set traced flag to true
+                    process_table[process_count].state = PSTATE_RUNNING; // Initially stopped due to SIGSTOP
                     process_count++;
                 } else {
                     // Handle error: too many processes
                 }
                 log_state_change(pid, PSTATE_NONE, PSTATE_RUNNING, 0); // Log state change to running
 
-
                 // Display process information
                 printf("%d\t%d\tT\t%s\t\t%s\n", deet_id, pid, "running", command_line);
 
                 // Stop the child process immediately
+                log_signal(SIGCHLD);
+                log_state_change(pid, PSTATE_RUNNING, PSTATE_STOPPED, 0);
+                printf("%d\t%d\tT\t%s\t\t%s\n", deet_id, pid, "stopped", command_line);
+                process_table[process_count - 1].state = PSTATE_STOPPED; // Initially stopped due to SIGSTOP
                 kill(pid, SIGSTOP);
-                log_state_change(pid, PSTATE_RUNNING, PSTATE_STOPPING, 0);
 
                 // Display process information again after stopping
                 //printf("%d\t%d\tT\t%s\t\t%s\n", deet_id, pid, "stopped", command_line);
@@ -223,24 +220,47 @@ void run_deet() {
         } else if (strcmp(command, "stop") == 0) {
             // Stop a running process
         } else if (strcmp(command, "cont") == 0) {
+            log_input(command_line);
             // Continue a stopped process
             if (args[0] == NULL) {
-                printf("No PID provided\n");
+                printf("No Deet ID provided\n");
                 continue;
             }
 
             // Extract the PID from the command arguments
-            pid_t pid_to_continue = atoi(args[0]); // Extract PID from args
+            int deet_id_to_continue = atoi(args[0]); // Extract Deet ID from args
+            pid_t pid_to_continue = get_pid(deet_id_to_continue); // Convert Deet ID to PID
+
+            if (pid_to_continue == -1) {
+                printf("Invalid Deet ID: %d\n", deet_id_to_continue);
+                continue;
+            }
 
             // Send SIGCONT to the specified process
             kill(pid_to_continue, SIGCONT);
             log_state_change(pid_to_continue, PSTATE_STOPPED, PSTATE_RUNNING, 0);
+
+            // Update the process state in the process table
+            update_process_state(pid_to_continue, PSTATE_RUNNING);
         } else if (strcmp(command, "release") == 0) {
             // Stop tracing a process
         } else if (strcmp(command, "wait") == 0) {
             // Wait for a process
         } else if (strcmp(command, "kill") == 0) {
+            log_input(command_line);
             // Terminate a process
+            if (args[0] == NULL) {
+                printf("No PID provided\n");
+                continue;
+            }
+
+            pid_t pid_to_kill = atoi(args[0]); // Extract PID from args
+
+            if (kill(pid_to_kill, SIGTERM) == -1) {
+                perror("kill");
+            } else {
+                log_state_change(pid_to_kill, PSTATE_RUNNING, PSTATE_KILLED, 0);
+            }
         } else if (strcmp(command, "peek") == 0) {
             // Read from address space
         } else if (strcmp(command, "poke") == 0) {

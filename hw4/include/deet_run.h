@@ -3,6 +3,6 @@
 
 extern int silent_logging;
 
-void run_deet();
+void run_deet(int silent_logging);
 
 #endif
